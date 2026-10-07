@@ -1,5 +1,6 @@
 package com.example.rag.profile;
 
+import com.example.rag.llm.ModelJson;
 import com.example.rag.observability.ModelReply;
 import com.example.rag.observability.TokenUsage;
 import com.google.gson.Gson;
@@ -20,7 +21,11 @@ import java.util.concurrent.TimeUnit;
 /** 使用聊天模型从用户原话中抽取结构化画像候选；不直接写数据库。 */
 public final class UserProfileExtractor implements AutoCloseable {
     private static final String API_URL = "https://api.siliconflow.cn/v1/chat/completions";
-    public static final String MODEL = "Qwen/Qwen3-32B";
+    // 模型选择（2026-09-16 换型）：抽取是短结构化输出（~50-200 token），原 Qwen/Qwen3-32B 在
+    // SiliconFlow 上排队尖峰严重（8 token 请求实测 28s~185s，频繁击穿 30s 读超时）。
+    // DeepSeek-V4-Flash 同负载实测 1.3s、JSON 干净且 evidence 逐字完整；
+    // 注意它在长文生成场景很慢（~845 token 需 75s），不适合本路以外的用途。
+    public static final String MODEL = "deepseek-ai/DeepSeek-V4-Flash";
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final String SYSTEM_PROMPT = """
@@ -46,8 +51,28 @@ public final class UserProfileExtractor implements AutoCloseable {
             7. 不推断性格、智力、疾病、家庭背景或其他敏感属性。
             8. 只输出合法JSON，不输出Markdown和分析过程。
 
+            你还要判断这条消息属于哪个「目标情境」。一个目标情境 = 用户当前正在攻克的一个
+            具体学习任务（例如“四级听力”“数学期末考”），或用户明确要求优先解决的、与当前
+            任务不同的具体问题（例如“注意力管理”“学习焦虑”）。输入里的 existingEpisodes 是用户
+            已有的活跃情境清单，每项含 id、label、goal、content。episodeDecision 规则：
+            1. 消息明显在继续清单里的某个情境（同一学习目标或内容）时，action="continue"，
+               并给出该情境的 episodeId。
+            2. 这是清单里没有的、新的学习目标时，action="new"，并给出一个简短中文 label
+               （不超过12个字，概括这个情境，如“四级听力”），episodeId 留空字符串。
+            3. 用户明确要求搁置当前话题、优先解决另一个问题时（例如“先别谈背单词了，先解决
+               注意力问题”），即使它不属于典型学科任务，也按 action="new" 处理，并给出简短
+               label（如“注意力管理”）——明确的切换要求优先于下一条的保守规则。
+            4. 拿不准时优先 continue 到最接近的活跃情境，不要轻易开新情境，避免情境碎片化。
+            5. 同一学科下的不同任务算不同情境（“英语期末完形”与“四级听力”是两个情境）。
+            6. existingEpisodes 为空时，一律 action="new" 并给出 label。
+
             输出结构：
             {
+              "episodeDecision": {
+                "action": "continue 或 new",
+                "episodeId": "continue 时填对应 id；new 时填空字符串",
+                "label": "new 时填简短情境名；continue 时填空字符串"
+              },
               "updates": {
                 "字段名": {
                   "value": "与字段类型一致的值",
@@ -57,13 +82,13 @@ public final class UserProfileExtractor implements AutoCloseable {
                 }
               }
             }
-            没有可提取信息时输出 {"updates":{}}。
+            没有可提取的画像字段时 updates 输出 {}，但 episodeDecision 仍必须给出。
             """;
 
     private final String apiKey;
     private final OkHttpClient client = new OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(90, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
             .build();
 
     public UserProfileExtractor(String apiKey) {
@@ -81,13 +106,15 @@ public final class UserProfileExtractor implements AutoCloseable {
         body.addProperty("temperature", 0);
         body.addProperty("max_tokens", 1000);
         body.addProperty("stream", false);
+        // 关思维链 + 不用 response_format:json_object：实测该结构化模式在 SiliconFlow 上
+        // 会劣化到 17~40 秒击穿 30 秒读超时，去掉后靠 system prompt 约束 + ModelJson 兜底解析，
+        // 同样的输出降到 1 秒级。详见 ModelJson 类注释。
         body.addProperty("enable_thinking", false);
-        JsonObject responseFormat = new JsonObject();
-        responseFormat.addProperty("type", "json_object");
-        body.add("response_format", responseFormat);
 
         JsonObject input = new JsonObject();
-        input.add("existingProfile", existingProfile == null ? new JsonObject() : existingProfile);
+        // 只给活跃情境摘要（id/label/goal/content），不给整份画像：既省 token，
+        // 又避免模型从旧画像反推新信息（抽取只应基于当前消息）。
+        input.add("existingEpisodes", EpisodeProfile.episodeSummaries(existingProfile));
         JsonArray history = new JsonArray();
         recentMessages.forEach(message -> {
             JsonObject item = new JsonObject();
@@ -100,7 +127,7 @@ public final class UserProfileExtractor implements AutoCloseable {
 
         JsonArray messages = new JsonArray();
         messages.add(message("system", SYSTEM_PROMPT));
-        messages.add(message("user", "请只从currentUserMessage抽取画像更新：\n" + GSON.toJson(input)));
+        messages.add(message("user", "请只从currentUserMessage抽取画像更新，并判断目标情境归属：\n" + GSON.toJson(input)));
         body.add("messages", messages);
 
         Request request = new Request.Builder()
@@ -119,7 +146,7 @@ public final class UserProfileExtractor implements AutoCloseable {
             String content = apiResponse.getAsJsonArray("choices").get(0).getAsJsonObject()
                     .getAsJsonObject("message").get("content").getAsString();
             try {
-                JsonObject extraction = JsonParser.parseString(content).getAsJsonObject();
+                JsonObject extraction = ModelJson.parseObject(content);
                 if (!extraction.has("updates") || !extraction.get("updates").isJsonObject()) {
                     throw new IllegalArgumentException("缺少updates对象");
                 }

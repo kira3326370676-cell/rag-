@@ -2,6 +2,7 @@ package com.example.rag.profile;
 
 import com.example.rag.observability.ModelCallLogger;
 import com.example.rag.observability.ModelReply;
+import com.example.rag.observability.TokenUsage;
 import com.example.rag.recommendation.FeedbackRepository;
 import com.example.rag.recommendation.RecommendationService;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -18,15 +19,26 @@ import javax.sql.DataSource;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 @Service
 public class UserProfileService {
     private static final int RECENT_MESSAGE_LIMIT = 12;
+    /** 推荐上下文里单条历史消息的字符上限：只给模型“认出追问”用的提纲，不搬全文。 */
+    private static final int RECOMMENDATION_CONTEXT_MESSAGE_CHARS = 400;
+    /** 推荐上下文最多携带几条历史：上一轮推荐 + 这轮追问通常 4 条内，留一倍余量。 */
+    private static final int RECOMMENDATION_CONTEXT_MESSAGES = 6;
+    /**
+     * 画像已就绪但推荐生成失败（该推荐却没给成）时的兜底话术：落库进对话历史，
+     * 并随 final 事件传给流式前端，覆盖模型半路失败留在界面上的半截增量。
+     */
+    private static final String RECOMMENDATION_UNAVAILABLE_TEXT = "这次推荐生成没有成功，请重新发送再试一次。";
     private static final Gson GSON = new Gson();
 
     private final DataSource dataSource;
@@ -84,73 +96,168 @@ public class UserProfileService {
     public TurnResult processMessage(String externalId, UUID conversationId, String content) {
         String normalizedId = normalizeExternalId(externalId);
         if (content == null || content.isBlank()) throw new IllegalArgumentException("消息内容不能为空");
+        TurnContext context = loadTurnContext(normalizedId, conversationId, content);
+        PreparedTurn prepared = extractAndMerge(context, content);
+        ProfileDecisionValidator.Decision decision = decideWithFallback(
+                prepared.activeView(), context.recentMessages(), prepared.fallback(),
+                context.userId(), context.conversationId());
 
-        TurnContext context = inTransaction(connection -> {
+        RecommendationService.RecommendationResult recommendation = null;
+        if (decision.ready()) {
+            try {
+                recommendation = recommendationService.recommend(
+                        prepared.activeView(), context.userId(), context.conversationId(),
+                        recommendationContext(context, content));
+            } catch (RecommendationService.RecommendationUnavailableException ignored) {
+                // 推荐失败不阻断画像流程，前端可稍后通过推荐接口重试。
+            }
+        }
+
+        return finishTurn(context, prepared, decision, recommendation);
+    }
+
+    /**
+     * processMessage 的流式版本：同一条管线把"进度、回复增量、推荐开头"实时写成 SSE 事件。
+     * 行为逐段对齐非流式版本：同样的兜底、同样的落库、同样以 TurnResult 收尾（final 事件）；
+     * 区别只在于用户不必等到全部生成完才看见第一段文字。中途流出的增量都不权威——模型半路
+     * 失败走兜底时文本会被 final 里的正式结果覆盖，前端一律以 final 为准。
+     */
+    public void processMessageStreaming(String externalId, UUID conversationId, String content, TurnStream sink) {
+        String normalizedId = normalizeExternalId(externalId);
+        if (content == null || content.isBlank()) throw new IllegalArgumentException("消息内容不能为空");
+        TurnContext context = loadTurnContext(normalizedId, conversationId, content);
+        sink.stage("extract");
+        PreparedTurn prepared = extractAndMerge(context, content);
+        sink.stage("decide");
+        ProfileDecisionValidator.Decision decision = decideWithFallbackStreaming(
+                prepared.activeView(), context.recentMessages(), prepared.fallback(),
+                context.userId(), context.conversationId(), sink::delta);
+
+        RecommendationService.RecommendationResult recommendation = null;
+        if (decision.ready()) {
+            sink.stage("recommend");
+            try {
+                recommendation = recommendationService.recommendStreaming(
+                        prepared.activeView(), context.userId(), context.conversationId(),
+                        recommendationContext(context, content), sink::delta);
+            } catch (RecommendationService.RecommendationUnavailableException ignored) {
+                // 与 processMessage 一致：推荐失败不阻断画像流程。
+            }
+        }
+
+        sink.finished(finishTurn(context, prepared, decision, recommendation));
+    }
+
+    /**
+     * 给推荐链裁剪对话上下文：当前消息原文 + 最近若干条历史摘要（含上一轮推荐全文，
+     * 模型靠它把“这些方法”对上号）。当前这条用户消息已单独传递，不再重复进历史。
+     * 没有它时，追问“详细讲讲怎么做”与首次请求的输入几乎相同，模型只会把同样的推荐再来一遍。
+     */
+    private static RecommendationService.TurnContext recommendationContext(TurnContext context, String content) {
+        List<RecommendationService.ConversationSnippet> snippets = new ArrayList<>();
+        for (MessageRepository.StoredMessage message : context.recentMessages()) {
+            if (message.id().equals(context.messageId())) continue;
+            String text = message.content();
+            if (text.length() > RECOMMENDATION_CONTEXT_MESSAGE_CHARS) {
+                text = text.substring(0, RECOMMENDATION_CONTEXT_MESSAGE_CHARS) + "…";
+            }
+            snippets.add(new RecommendationService.ConversationSnippet(message.role(), text));
+        }
+        if (snippets.size() > RECOMMENDATION_CONTEXT_MESSAGES) {
+            snippets = snippets.subList(snippets.size() - RECOMMENDATION_CONTEXT_MESSAGES, snippets.size());
+        }
+        return new RecommendationService.TurnContext(content.trim(), List.copyOf(snippets));
+    }
+
+    /** 一轮对话的公共开头：保存用户消息、读出真实画像与最近上下文（含"是否本会话首条"）。 */
+    private TurnContext loadTurnContext(String normalizedId, UUID conversationId, String content) {
+        return inTransaction(connection -> {
             UUID userId = requireUser(connection, normalizedId);
             requireConversationOwnership(connection, conversationId, userId);
             UUID messageId = messages.save(connection, conversationId, "user", content, new JsonObject());
             Optional<UserProfileRepository.StoredProfile> stored = profiles.findByUserId(connection, userId);
-            JsonObject profile = stored.map(UserProfileRepository.StoredProfile::profile)
-                    .orElseGet(JsonObject::new);
+            JsonObject profile = EpisodeProfile.normalize(
+                    stored.map(UserProfileRepository.StoredProfile::profile).orElseGet(JsonObject::new));
             int version = stored.map(UserProfileRepository.StoredProfile::version).orElse(0);
             List<MessageRepository.StoredMessage> recent =
                     messages.findRecent(connection, conversationId, RECENT_MESSAGE_LIMIT);
-            return new TurnContext(userId, messageId, profile, version, recent);
+            return new TurnContext(
+                    userId, conversationId, messageId, profile, version, recent, isFirstUserMessage(recent));
         });
+    }
 
+    /** 抽取 + 校验 + 合并 + 就绪评估：流式与非流式两条路径完全共用的中段。 */
+    private PreparedTurn extractAndMerge(TurnContext context, String content) {
         ModelReply<JsonObject> extractionReply;
         JsonObject extractInput = new JsonObject();
         extractInput.addProperty("currentUserMessage", content.trim());
         long extractStart = System.currentTimeMillis();
+        // 新会话首条消息对抽取器隐藏旧情境清单（保留共享层）：模型按"清单为空一律开新"
+        // 为新会话开新情境。"新会话=新话题"由服务端保证；合并仍走真实画像，同名情境会被复用。
+        JsonObject extractionProfile = context.firstUserMessage()
+                ? EpisodeProfile.withoutActiveEpisodes(context.profile())
+                : context.profile();
         try {
-            extractionReply = extractor.extract(context.profile(), context.recentMessages(), content.trim());
-            callLogger.log(context.userId(), conversationId, "extract", UserProfileExtractor.MODEL,
+            extractionReply = extractor.extract(extractionProfile, context.recentMessages(), content.trim());
+            callLogger.log(context.userId(), context.conversationId(), "extract", UserProfileExtractor.MODEL,
                     extractInput, extractionReply.content(), System.currentTimeMillis() - extractStart,
                     "success", null, extractionReply.usage());
         } catch (IOException error) {
             // 请求本身就失败了，没有用量可记。传 null 而不是三个 0：后者会把这次没花钱的
             // 调用算进平均用量里。
-            callLogger.log(context.userId(), conversationId, "extract", UserProfileExtractor.MODEL,
+            callLogger.log(context.userId(), context.conversationId(), "extract", UserProfileExtractor.MODEL,
                     extractInput, null, System.currentTimeMillis() - extractStart, "failed", error.getMessage(),
                     null);
             throw new ProfileModelException("画像抽取服务暂时不可用", error);
         }
         UserProfileValidator.ValidationResult validation =
                 validator.validate(extractionReply.content(), content.trim());
-        JsonObject merged = merger.merge(context.profile(), validation.acceptedUpdates(), context.messageId());
-        ProfileReadinessPolicy.Decision fallback = readinessPolicy.evaluate(merged);
-        ProfileDecisionValidator.Decision decision = decideWithFallback(
-                merged, context.recentMessages(), fallback, context.userId(), conversationId);
+        JsonObject episodeDecision = extractionReply.content().has("episodeDecision")
+                && extractionReply.content().get("episodeDecision").isJsonObject()
+                ? extractionReply.content().getAsJsonObject("episodeDecision") : null;
+        JsonObject merged = merger.merge(
+                context.profile(), validation.acceptedUpdates(), episodeDecision, context.messageId());
+        // 下游 readiness / decider / recommend 继续吃扁平视图（共享层 + 当前情境），无需感知情境结构。
+        JsonObject activeView = EpisodeProfile.flattenedActiveView(merged);
+        ProfileReadinessPolicy.Decision fallback = readinessPolicy.evaluate(activeView);
+        return new PreparedTurn(merged, activeView, fallback, validation);
+    }
 
-        RecommendationService.RecommendationResult recommendation = null;
-        if (decision.ready()) {
-            try {
-                recommendation = recommendationService.recommend(merged, context.userId(), conversationId);
-            } catch (RecommendationService.RecommendationUnavailableException ignored) {
-                // 推荐失败不阻断画像流程，前端可稍后通过推荐接口重试。
-            }
-        }
-
-        RecommendationService.RecommendationResult finalRecommendation = recommendation;
+    /** 落库 + 观测刷新 + 组装 TurnResult：流式与非流式两条路径完全共用的收尾。 */
+    private TurnResult finishTurn(TurnContext context, PreparedTurn prepared,
+            ProfileDecisionValidator.Decision decision,
+            RecommendationService.RecommendationResult recommendation) {
         UUID[] assistantMessageId = new UUID[1];
         inTransaction(connection -> {
             boolean saved = profiles.saveIfVersion(
-                    connection, context.userId(), merged, fallback.completeness(), context.profileVersion());
+                    connection, context.userId(), prepared.merged(), prepared.fallback().completeness(),
+                    context.profileVersion());
             if (!saved) throw new ProfileConflictException("画像已被另一条请求更新，请重试当前消息");
+            conversations.updateEpisode(
+                    connection, context.conversationId(), EpisodeProfile.activeEpisodeId(prepared.merged()));
             if (!decision.ready()) {
                 JsonObject metadata = new JsonObject();
                 metadata.addProperty("messageType", "profile_question");
                 metadata.addProperty("decisionConfidence", decision.confidence());
                 metadata.addProperty("decisionReason", decision.reason());
                 assistantMessageId[0] = messages.save(
-                        connection, conversationId, "assistant", decision.nextQuestion(), metadata);
-            } else if (finalRecommendation != null) {
+                        connection, context.conversationId(), "assistant", decision.nextQuestion(), metadata);
+            } else if (recommendation != null) {
                 JsonObject metadata = new JsonObject();
                 metadata.addProperty("messageType", "recommendation");
-                metadata.addProperty("recommendationStatus", finalRecommendation.status());
-                metadata.add("recommendation", JsonParser.parseString(GSON.toJson(finalRecommendation)));
+                metadata.addProperty("recommendationStatus", recommendation.status());
+                metadata.add("recommendation", JsonParser.parseString(GSON.toJson(recommendation)));
                 assistantMessageId[0] = messages.save(
-                        connection, conversationId, "assistant", finalRecommendation.answer(), metadata);
+                        connection, context.conversationId(), "assistant", recommendation.answer(), metadata);
+            } else {
+                // 画像已就绪但推荐生成失败（上游已吞掉异常）：必须留一条明确的兜底消息。
+                // 否则这一轮在对话记录里整体消失，流式界面还会把半截增量永久留在屏幕上
+                // ——2026-10-07 张威会话连续 4 轮推荐失败、4 条 assistant 消息全部缺失。
+                JsonObject metadata = new JsonObject();
+                metadata.addProperty("messageType", "recommendation_unavailable");
+                assistantMessageId[0] = messages.save(
+                        connection, context.conversationId(), "assistant",
+                        RECOMMENDATION_UNAVAILABLE_TEXT, metadata);
             }
             return null;
         });
@@ -159,11 +266,15 @@ public class UserProfileService {
         // 采集失败不会抛到这里（服务内部已吃掉），对话不会因旁路数据而失败。
         observations.refresh(context.userId());
 
+        // 推荐失败的轮次把兜底话术放进 assistantMessage：流式前端以它为准覆盖已流出的
+        // 半截增量（app.js 权威文本优先取 recommendation，其次 assistantMessage）。
+        String assistantMessage = decision.ready() && recommendation == null
+                ? RECOMMENDATION_UNAVAILABLE_TEXT : decision.nextQuestion();
         return new TurnResult(
-                decision.action(), decision.ready(), fallback.completeness(), decision.confidence(),
-                decision.reason(), decision.nextQuestion(), decision.missingInformation(),
-                decision.conflicts(), toMap(merged), toMap(validation.acceptedUpdates()),
-                validation.rejections().size(), finalRecommendation, assistantMessageId[0]);
+                decision.action(), decision.ready(), prepared.fallback().completeness(), decision.confidence(),
+                decision.reason(), assistantMessage, decision.missingInformation(),
+                decision.conflicts(), toMap(prepared.merged()), toMap(prepared.validation().acceptedUpdates()),
+                prepared.validation().rejections().size(), recommendation, assistantMessageId[0]);
     }
 
     public ProfileResult getProfile(String externalId) {
@@ -172,7 +283,7 @@ public class UserProfileService {
             UUID userId = requireUser(connection, normalizedId);
             return profiles.findByUserId(connection, userId)
                     .map(profile -> new ProfileResult(
-                            profile.userId(), toMap(profile.profile()), profile.version(),
+                            profile.userId(), toMap(EpisodeProfile.normalize(profile.profile())), profile.version(),
                             profile.completeness(), profile.updatedAt().toString()))
                     .orElseThrow(() -> new ProfileNotFoundException("该用户还没有画像"));
         });
@@ -216,7 +327,8 @@ public class UserProfileService {
                     .map(UserProfileRepository.StoredProfile::profile)
                     .orElseThrow(() -> new ProfileNotFoundException("该用户还没有画像"));
         });
-        return recommendationService.recommend(profile, userHolder[0], null);
+        return recommendationService.recommend(EpisodeProfile.flattenedActiveView(profile), userHolder[0], null,
+                RecommendationService.TurnContext.empty());
     }
 
     private static final int CONVERSATION_TITLE_LENGTH = 30;
@@ -227,6 +339,14 @@ public class UserProfileService {
         String title = firstMessage.trim().replaceAll("\\s+", " ");
         return title.length() <= CONVERSATION_TITLE_LENGTH
                 ? title : title.substring(0, CONVERSATION_TITLE_LENGTH) + "…";
+    }
+
+    /**
+     * recent 中恰有一条 user 消息（即刚保存的本条）时，它正是本会话的第一条用户消息。
+     * 新会话由此识别：首条消息对抽取器隐藏旧情境清单，保证"新会话=新话题"。
+     */
+    static boolean isFirstUserMessage(List<MessageRepository.StoredMessage> recent) {
+        return recent.stream().filter(message -> "user".equals(message.role())).count() == 1;
     }
 
     private ProfileDecisionValidator.Decision decideWithFallback(
@@ -242,6 +362,7 @@ public class UserProfileService {
             ProfileDecisionValidator.Decision decision = reply.content();
             JsonObject output = new JsonObject();
             output.addProperty("action", decision.action());
+            output.addProperty("intent", decision.intent());
             output.addProperty("ready", decision.ready());
             output.addProperty("confidence", decision.confidence());
             output.addProperty("reason", decision.reason());
@@ -249,14 +370,71 @@ public class UserProfileService {
                     null, output, System.currentTimeMillis() - start, "success", null, reply.usage());
             return decision;
         } catch (Exception error) {
-            // 走本地兜底就没有调用模型，用量传 null。这一行的价值在 status='fallback' 与
-            // error_message 上：它们是模型一最需要的难样本标签。
+            // 走本地兜底就没有调用模型，用量传 null——唯一的例外是格式校验失败：那次
+            // 调用真实发生过，模型原始输出与 token 用量随 ProfileDecisionFormatException
+            // 带出来，写进 output_json.rawContent。status、error_message 与这个字段合起来，
+            // 就是模型一最需要的难样本。
+            FallbackSample sample = FallbackSample.from(error);
             callLogger.log(userId, conversationId, "decide", ConversationalProfileAgent.MODEL,
-                    null, null, System.currentTimeMillis() - start, "fallback", error.getMessage(), null);
+                    null, sample.output(), System.currentTimeMillis() - start, "fallback",
+                    error.getMessage(), sample.usage());
             return new ProfileDecisionValidator.Decision(
-                    fallback.ready() ? "recommend" : "ask", fallback.ready(), 0,
+                    fallback.ready() ? "recommend" : "ask", "unknown", fallback.ready(), 0,
                     "画像 Agent 调用失败，使用本地兜底规则", fallback.missingFields(), List.of(),
                     fallback.followUpQuestion() == null ? "" : fallback.followUpQuestion());
+        }
+    }
+
+    /** decideWithFallback 的流式版本：回复增量边生成边推给用户，兜底与日志逐行对齐。 */
+    private ProfileDecisionValidator.Decision decideWithFallbackStreaming(
+            JsonObject profile,
+            List<MessageRepository.StoredMessage> recent,
+            ProfileReadinessPolicy.Decision fallback,
+            UUID userId,
+            UUID conversationId,
+            Consumer<String> onReplyDelta
+    ) {
+        long start = System.currentTimeMillis();
+        try {
+            ModelReply<ProfileDecisionValidator.Decision> reply =
+                    profileAgent.decideStream(profile, recent, onReplyDelta);
+            ProfileDecisionValidator.Decision decision = reply.content();
+            JsonObject output = new JsonObject();
+            output.addProperty("action", decision.action());
+            output.addProperty("intent", decision.intent());
+            output.addProperty("ready", decision.ready());
+            output.addProperty("confidence", decision.confidence());
+            output.addProperty("reason", decision.reason());
+            callLogger.log(userId, conversationId, "decide", ConversationalProfileAgent.MODEL,
+                    null, output, System.currentTimeMillis() - start, "success", null, reply.usage());
+            return decision;
+        } catch (Exception error) {
+            // 与非流式路径同一套兜底、同一套难样本留存；已流出的半段回复会在 final
+            // 事件里被权威文本覆盖。
+            FallbackSample sample = FallbackSample.from(error);
+            callLogger.log(userId, conversationId, "decide", ConversationalProfileAgent.MODEL,
+                    null, sample.output(), System.currentTimeMillis() - start, "fallback",
+                    error.getMessage(), sample.usage());
+            return new ProfileDecisionValidator.Decision(
+                    fallback.ready() ? "recommend" : "ask", "unknown", fallback.ready(), 0,
+                    "画像 Agent 调用失败，使用本地兜底规则", fallback.missingFields(), List.of(),
+                    fallback.followUpQuestion() == null ? "" : fallback.followUpQuestion());
+        }
+    }
+
+    /**
+     * fallback 行的难样本：只有格式校验失败时才有原始输出可留——网络失败、超时等情形
+     * 模型根本没有产出内容，返回全 null 保持旧行为（output_json 为空）。原始输出不在这里
+     * 脱敏：ModelCallLogger 写入时会统一 scrub，隐私闸在唯一入口上。
+     */
+    private record FallbackSample(JsonObject output, TokenUsage usage) {
+        static FallbackSample from(Exception error) {
+            if (!(error instanceof ProfileDecisionFormatException formatFailure)) {
+                return new FallbackSample(null, null);
+            }
+            JsonObject output = new JsonObject();
+            output.addProperty("rawContent", formatFailure.rawContent());
+            return new FallbackSample(output, formatFailure.usage());
         }
     }
 
@@ -311,10 +489,21 @@ public class UserProfileService {
 
     private record TurnContext(
             UUID userId,
+            UUID conversationId,
             UUID messageId,
             JsonObject profile,
             int profileVersion,
-            List<MessageRepository.StoredMessage> recentMessages
+            List<MessageRepository.StoredMessage> recentMessages,
+            boolean firstUserMessage
+    ) {
+    }
+
+    /** 抽取与合并完成后、落库之前的结果：两条路径共用 finishTurn 所需的全部中间产物。 */
+    private record PreparedTurn(
+            JsonObject merged,
+            JsonObject activeView,
+            ProfileReadinessPolicy.Decision fallback,
+            UserProfileValidator.ValidationResult validation
     ) {
     }
 

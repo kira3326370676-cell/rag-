@@ -123,6 +123,32 @@ header h1 {
     color: #1d4ed8;
 }
 
+/* “更早的会话”展开/收起：只是显示开关，不删除也不改变任何数据 */
+#conversationList li.conversation-toggle {
+    padding: 2px 0;
+    cursor: default;
+}
+
+#conversationList li.conversation-toggle:hover {
+    background: transparent;
+}
+
+.conversation-toggle button {
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: #1d4ed8;
+    font-size: 12px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    text-align: center;
+}
+
+.conversation-toggle button:hover {
+    background: #f2f3f5;
+}
+
 /* 聊天主区 */
 #chat {
     flex: 1;
@@ -216,6 +242,45 @@ header h1 {
 
 .typing .dot:nth-child(3) {
     animation-delay: 0.4s;
+}
+
+.typing .typing-label {
+    margin-left: 8px;
+    font-size: 12px;
+    color: #8a8f99;
+    white-space: nowrap;
+}
+
+/* 发送失败行：贴近用户一侧的提示条，带“重新发送”按钮 */
+.retry-row {
+    justify-content: flex-end;
+}
+
+.retry-row .bubble.retry {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: #fff7f7;
+    border: 1px solid #f3c9c9;
+    border-top-right-radius: 4px;
+    color: #b42318;
+    font-size: 13px;
+}
+
+.retry-row .bubble.retry button {
+    flex-shrink: 0;
+    padding: 3px 10px;
+    border: 1px solid #b42318;
+    border-radius: 8px;
+    background: transparent;
+    color: #b42318;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.retry-row .bubble.retry button:hover {
+    background: #b42318;
+    color: #fff;
 }
 
 @keyframes blink {
@@ -315,6 +380,47 @@ header h1 {
     font-size: 11px;
     color: #a9aeb8;
     margin: 8px 0 0;
+}
+
+/* 研究依据 */
+.evidence {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #f0f7f6;
+    border-radius: 8px;
+}
+
+.evidence-title {
+    margin: 0 0 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #0d9488;
+}
+
+.evidence-item {
+    margin: 0 0 3px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: #4e5969;
+}
+
+.evidence-item:last-child {
+    margin-bottom: 0;
+}
+
+.evidence-citation {
+    margin-left: 6px;
+    color: #86909c;
+}
+
+.evidence-link {
+    margin-left: 6px;
+    color: #1d4ed8;
+    text-decoration: none;
+}
+
+.evidence-link:hover {
+    text-decoration: underline;
 }
 
 .follow-up {
@@ -522,6 +628,38 @@ header h1 {
     font-size: 12px;
     color: #86909c;
     margin: 0;
+}
+
+/* 卡内子层：该方法被推荐过的每一次，点时间跳回当时对话 */
+.records-title {
+    font-size: 12px;
+    color: #86909c;
+    margin: 10px 0 4px;
+}
+
+.method-records {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    list-style: none;
+    margin: 0 0 4px;
+    padding: 0;
+}
+
+.record-link {
+    border: none;
+    background: none;
+    padding: 0;
+    font-size: 12px;
+    color: #1d4ed8;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 3px;
+}
+
+.record-link:hover {
+    text-decoration-style: solid;
 }
 
 /* 按时间流水视图 */
@@ -748,6 +886,33 @@ header h1 {
     color: #a9aeb8;
     font-size: 13px;
     line-height: 1.7;
+}
+
+.profile-section {
+    margin-bottom: 18px;
+}
+
+.profile-section-title {
+    font-size: 12px;
+    color: #4e5969;
+    font-weight: 600;
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #f2f3f5;
+}
+
+.episode-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.episode-chip {
+    font-size: 12px;
+    color: #4e5969;
+    background: #f2f3f5;
+    border-radius: 10px;
+    padding: 2px 10px;
 }
 
 .access-gate {

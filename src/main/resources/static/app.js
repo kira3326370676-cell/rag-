@@ -1,11 +1,15 @@
-const PROFILE_LABELS = {
+// 画像分两层展示：情境层（随当前学习目标变化）与共享层（跨目标通用的你）。
+const EPISODE_LABELS = {
     learningGoal: "学习目标",
     learningContent: "学习内容",
     mainDifficulty: "主要困难",
-    availableMinutesPerDay: "每天可用时间",
     daysUntilDeadline: "距截止日期",
-    preferredLearningStyle: "偏好方式",
     triedMethods: "试过的方法"
+};
+
+const SHARED_LABELS = {
+    preferredLearningStyle: "偏好方式",
+    availableMinutesPerDay: "每天可用时间"
 };
 
 const PROFILE_UNITS = {
@@ -40,8 +44,14 @@ if (!externalId) {
 }
 let conversationId = null;
 let sending = false;
+/** 生成中的轮次：{ conversationId, text, bubble }。切换会话后据此把流接回界面。 */
+let activeTurn = null;
 let historyEvents = [];
 let historyViewMode = "method";
+
+/** 侧边栏默认只展示最近这么多条会话，更早的收进“更早的会话”一键展开。 */
+const RECENT_CONVERSATION_COUNT = 12;
+let conversationsExpanded = false;
 
 const elements = {
     toggleSidebar: document.getElementById("toggleSidebar"),
@@ -64,6 +74,13 @@ const elements = {
     tabByTime: document.getElementById("tabByTime"),
     closeHistory: document.getElementById("closeHistory"),
     historyStatus: document.getElementById("historyStatus")
+};
+
+/** 流式事件里的阶段提示文案（stage 事件 → “正在…”），与后端 TurnStreamSink 的 stage 取值对应。 */
+const STAGE_LABELS = {
+    extract: "正在理解你的情况…",
+    decide: "正在想怎么回复你…",
+    recommend: "正在检索合适的学习策略…"
 };
 
 function apiUrl(path) {
@@ -108,7 +125,10 @@ async function loadConversations() {
     try {
         const conversations = await http("GET", "/conversations");
         elements.conversationList.innerHTML = "";
-        conversations.forEach(conversation => {
+        // 默认只显示最近的会话：长期使用会让列表一直往下堆，更早的收进一个入口里。
+        const visible = conversationsExpanded
+            ? conversations : conversations.slice(0, RECENT_CONVERSATION_COUNT);
+        visible.forEach(conversation => {
             const item = document.createElement("li");
             const title = document.createElement("span");
             title.textContent = conversation.title;
@@ -121,9 +141,29 @@ async function loadConversations() {
             item.addEventListener("click", () => openConversation(conversation.conversationId));
             elements.conversationList.appendChild(item);
         });
+        if (conversations.length > RECENT_CONVERSATION_COUNT) {
+            elements.conversationList.appendChild(
+                renderConversationToggle(conversations.length - RECENT_CONVERSATION_COUNT));
+        }
     } catch (error) {
         showStatus(error.message);
     }
+}
+
+/** “更早的会话”展开/收起入口：只是显示开关，不删除也不改变任何数据。 */
+function renderConversationToggle(hiddenCount) {
+    const item = document.createElement("li");
+    item.className = "conversation-toggle";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = conversationsExpanded
+        ? "收起更早的会话" : "展开更早的 " + hiddenCount + " 条 ▾";
+    button.addEventListener("click", () => {
+        conversationsExpanded = !conversationsExpanded;
+        loadConversations();
+    });
+    item.appendChild(button);
+    return item;
 }
 
 async function openConversation(id) {
@@ -132,10 +172,25 @@ async function openConversation(id) {
         const messages = await http("GET", `/conversations/${id}/messages`);
         elements.messages.innerHTML = "";
         messages.forEach(renderMessage);
+        reopenActiveTurn(id);
         scrollToBottom();
         loadConversations();
     } catch (error) {
         showStatus(error.message);
+    }
+}
+
+/**
+ * 切回某会话时，若它还有一轮正在生成，把已收到的增量接回界面（后续增量继续写入新气泡）。
+ * 生成中的流不属于任何一次消息快照，但后端会照常跑完落库；这里只负责让“正在生成”重新可见。
+ */
+function reopenActiveTurn(id) {
+    if (!activeTurn || activeTurn.conversationId !== id) return;
+    if (activeTurn.text) {
+        activeTurn.bubble = createAssistantBubble();
+        activeTurn.bubble.textContent = activeTurn.text;
+    } else {
+        activeTurn.bubble = null; // 还没有任何增量：等首个 delta 到达时再创建气泡
     }
 }
 
@@ -156,46 +211,129 @@ async function sendMessage(event) {
     event.preventDefault();
     const content = elements.input.value.trim();
     if (!content || sending) return;
+    elements.input.value = "";
+    autoResize();
+    await runTurn(content, true);
+}
+
+/**
+ * 执行一轮发送（首次发送与重试共用）。echo=true 时先画用户气泡；重试传 false，避免出现两条相同的用户消息。
+ *
+ * 生成期间允许用户切换会话：流不会被前端打断（后端照常跑完落库）；所有界面写入先检查
+ * “用户是否还在原会话”，不在就只累积文本不碰 DOM，切回时由 reopenActiveTurn 接回；
+ * 流结束时同样按在场与否决定就地渲染还是留待切回快照呈现。
+ */
+async function runTurn(content, echo) {
+    if (sending) return;
     sending = true;
     elements.send.disabled = true;
     showStatus("");
 
+    let turnConversationId = null;
     try {
         await ensureConversation();
-        hideWelcome();
-        renderMessage({ role: "user", content });
-        elements.input.value = "";
-        autoResize();
+        turnConversationId = conversationId;
+
+        if (echo) {
+            hideWelcome();
+            renderMessage({ role: "user", content });
+        }
         const typing = renderTyping();
         scrollToBottom();
 
-        try {
-            const turn = await http("POST", `/conversations/${conversationId}/messages`, { content });
+        activeTurn = { conversationId: turnConversationId, text: "", bubble: null };
+
+        // 流式渲染：第一段文字一到就撤掉“正在输入”，之后的增量直接追加。
+        // 中途增量都不权威（模型半路失败会换成兜底文本），最终以 final 事件为准。
+        let finalTurn = null;
+        let streamError = null;
+
+        const showDelta = delta => {
+            activeTurn.text += delta;
+            if (conversationId !== turnConversationId) return; // 已切走：只累积，不碰界面
             typing.remove();
-            if (turn.assistantMessage) {
-                renderMessage({ role: "assistant", content: turn.assistantMessage });
-            }
-            if (turn.recommendation) {
-                renderMessage({
-                    role: "assistant",
-                    content: turn.recommendation.answer,
-                    recommendation: turn.recommendation,
-                    messageId: turn.assistantMessageId
-                });
-            }
-            loadProfile();
-            loadConversations();
+            if (!activeTurn.bubble) activeTurn.bubble = createAssistantBubble();
+            activeTurn.bubble.textContent = activeTurn.text;
+            scrollToBottom();
+        };
+
+        try {
+            await streamTurn(content, {
+                onStage: stage => setTypingLabel(typing, STAGE_LABELS[stage]),
+                onDelta: showDelta,
+                onFinal: turn => { finalTurn = turn; },
+                onError: message => { streamError = message; }
+            });
         } finally {
             typing.remove();
         }
+
+        if (streamError) {
+            failTurn(turnConversationId, content, streamError);
+        } else if (finalTurn) {
+            const authoritative = finalTurn.recommendation
+                ? finalTurn.recommendation.answer
+                : (finalTurn.assistantMessage || "");
+            if (conversationId === turnConversationId) {
+                if (authoritative) {
+                    if (!activeTurn.bubble) activeTurn.bubble = createAssistantBubble();
+                    activeTurn.bubble.textContent = authoritative;
+                }
+                if (finalTurn.recommendation && activeTurn.bubble) {
+                    activeTurn.bubble.appendChild(renderRecommendation(
+                        finalTurn.recommendation, finalTurn.assistantMessageId || null, []));
+                }
+            }
+            loadProfile();
+            loadConversations();
+        }
     } catch (error) {
-        showStatus(error.message);
+        if (turnConversationId) {
+            failTurn(turnConversationId, content, error.message);
+        } else {
+            // 连会话都没建成：这轮没送出去，把内容放回输入框让用户稍后再试
+            showStatus(error.message);
+            if (!elements.input.value) {
+                elements.input.value = content;
+                autoResize();
+            }
+        }
     } finally {
+        activeTurn = null;
         sending = false;
         elements.send.disabled = false;
         scrollToBottom();
         elements.input.focus();
     }
+}
+
+/** 一轮失败：提示原因；用户仍在原会话时给出“重新发送”入口，已切走则静默（切回后以落库内容为准）。 */
+function failTurn(turnConversationId, content, message) {
+    showStatus(message);
+    if (conversationId !== turnConversationId) return;
+    renderRetryRow(content, message);
+}
+
+/** 失败行的“重新发送”入口：复用原内容重跑一轮，不再重复画用户气泡。 */
+function renderRetryRow(content, message) {
+    const row = document.createElement("div");
+    row.className = "message-row retry-row";
+    const bubble = document.createElement("div");
+    bubble.className = "bubble retry";
+    const label = document.createElement("span");
+    label.textContent = (message ? message + "；" : "") + "可以重新发送";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "重新发送";
+    button.addEventListener("click", () => {
+        row.remove();
+        runTurn(content, false);
+    });
+    bubble.appendChild(label);
+    bubble.appendChild(button);
+    row.appendChild(bubble);
+    elements.messages.appendChild(row);
+    scrollToBottom();
 }
 
 function renderMessage(message) {
@@ -230,13 +368,119 @@ function renderTyping() {
     const row = document.createElement("div");
     row.className = "message-row assistant typing";
     row.innerHTML = '<div class="avatar">策</div><div class="message-body">' +
-        '<div class="bubble"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div></div>';
+        '<div class="bubble"><span class="dot"></span><span class="dot"></span><span class="dot"></span>' +
+        '<span class="typing-label"></span></div></div>';
     elements.messages.appendChild(row);
     scrollToBottom();
     return row;
 }
 
+/** 流式文本到达时创建的空助手气泡；结构与会话历史里的助手消息保持一致。 */
+function createAssistantBubble() {
+    const row = document.createElement("div");
+    row.className = "message-row assistant";
+    const avatar = document.createElement("div");
+    avatar.className = "avatar";
+    avatar.textContent = "策";
+    row.appendChild(avatar);
+    const body = document.createElement("div");
+    body.className = "message-body";
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    body.appendChild(bubble);
+    row.appendChild(body);
+    elements.messages.appendChild(row);
+    return bubble;
+}
+
+/** stage 事件驱动的等待提示；typing 行已被真实气泡替换后就什么都不做。 */
+function setTypingLabel(typingRow, text) {
+    if (!text || !typingRow.isConnected) return;
+    const label = typingRow.querySelector(".typing-label");
+    if (label) label.textContent = text;
+}
+
+/**
+ * POST 消息并以 SSE 读取处理进度。不用 EventSource 的原因：它只支持 GET，
+ * 而发消息必须带请求体；fetch 的 body 流可以逐块读到服务端推来的事件帧。
+ */
+async function streamTurn(content, handlers) {
+    const headers = { "Content-Type": "application/json; charset=utf-8", "Accept": "text/event-stream" };
+    if (accessCode) headers["X-Access-Code"] = accessCode;
+    const response = await fetch(apiUrl(`/conversations/${conversationId}/messages/stream`), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ content })
+    });
+    if (response.status === 401) {
+        localStorage.removeItem("accessCode");
+        accessCode = "";
+        showAccessGate();
+        throw new Error("需要有效的访问码");
+    }
+    if (!response.ok) {
+        let detail = "操作没有成功，请稍后再试";
+        try {
+            const problem = await response.json();
+            if (problem.detail) detail = problem.detail;
+        } catch (ignored) {
+            // 保留默认错误信息
+        }
+        throw new Error(detail);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let separator;
+        while ((separator = buffer.indexOf("\n\n")) >= 0) {
+            dispatchStreamFrame(buffer.slice(0, separator), handlers);
+            buffer = buffer.slice(separator + 2);
+        }
+    }
+    // 服务端正常结束时事件也以空行收尾；buffer 里若剩残帧（连接被截断）做防御性处理。
+    if (buffer.trim()) dispatchStreamFrame(buffer, handlers);
+}
+
+/** 解析一个 SSE 事件帧（event: 行 + data: 行）并派发给对应回调。 */
+function dispatchStreamFrame(frame, handlers) {
+    let eventName = "message";
+    const dataLines = [];
+    frame.split("\n").forEach(rawLine => {
+        const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+        if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+    });
+    if (!dataLines.length) return;
+    let payload;
+    try {
+        payload = JSON.parse(dataLines.join("\n"));
+    } catch (ignored) {
+        return;
+    }
+    if (eventName === "stage") handlers.onStage(payload.stage);
+    else if (eventName === "delta") handlers.onDelta(payload.text || "");
+    else if (eventName === "final") handlers.onFinal(payload);
+    else if (eventName === "error") handlers.onError(payload.message || "服务暂时不可用，请稍后再试");
+}
+
 function renderRecommendation(result, messageId, likedStrategies) {
+    // explain：对已推荐方法的追问展开——教学正文已作为气泡文本显示，这里只补追问引导，
+    // 不再渲染推荐卡片，否则用户会看到“教学正文 + 重复的旧卡片”两层内容。
+    if (result.status === "explain") {
+        const guide = document.createElement("div");
+        (result.followUpQuestions || []).forEach(question => {
+            const followUp = document.createElement("p");
+            followUp.className = "follow-up";
+            followUp.textContent = question;
+            guide.appendChild(followUp);
+        });
+        return guide;
+    }
+
     const card = document.createElement("div");
     card.className = "recommendation-card";
 
@@ -276,11 +520,13 @@ function renderRecommendation(result, messageId, likedStrategies) {
             block.appendChild(note);
         });
 
-        const meta = document.createElement("p");
-        meta.className = "meta";
-        meta.textContent = "来源 " + (recommendation.sourceIds || []).join("、");
-        block.appendChild(meta);
+        const evidence = (result.evidenceSources || [])
+            .filter(item => item.strategyId === recommendation.strategyId);
+        if (evidence.length > 0) {
+            block.appendChild(renderEvidence(evidence));
+        }
 
+        // 不渲染裸 source-00x 编号：内部 ID 对学习者无意义，可信度由上方研究依据块承担。
         if (messageId) {
             block.appendChild(renderFeedbackActions(
                 messageId, recommendation.strategyId,
@@ -298,6 +544,41 @@ function renderRecommendation(result, messageId, likedStrategies) {
     });
 
     return card;
+}
+
+/**
+ * 研究依据块：一句话结论 + 文献引用 + 可点开的原文链接。
+ * 数据来自后端的 evidenceSources（证据 chunk 的结构化拆解），没证据时不渲染。
+ */
+function renderEvidence(evidence) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "evidence";
+    const title = document.createElement("p");
+    title.className = "evidence-title";
+    title.textContent = "研究依据";
+    wrapper.appendChild(title);
+    evidence.forEach(item => {
+        const line = document.createElement("p");
+        line.className = "evidence-item";
+        line.textContent = item.claim || "研究证据";
+        if (item.citation) {
+            const citation = document.createElement("span");
+            citation.className = "evidence-citation";
+            citation.textContent = item.citation;
+            line.appendChild(citation);
+        }
+        if (item.url) {
+            const link = document.createElement("a");
+            link.className = "evidence-link";
+            link.href = item.url;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = "原文 ↗";
+            line.appendChild(link);
+        }
+        wrapper.appendChild(line);
+    });
+    return wrapper;
 }
 
 /**
@@ -359,39 +640,94 @@ async function loadProfile() {
 
 function renderProfile(profile) {
     elements.profile.innerHTML = "";
-    const fields = Object.keys(PROFILE_LABELS).filter(field => profile[field]);
-    if (fields.length === 0) {
+    const episodes = Array.isArray(profile.episodes) ? profile.episodes : [];
+    const active = episodes.find(item => item.id === profile.activeEpisodeId) || episodes[0] || null;
+    const shared = profile.shared || {};
+
+    // 第一段：当前目标情境。
+    const currentSection = document.createElement("div");
+    currentSection.className = "profile-section";
+    const currentTitle = document.createElement("div");
+    currentTitle.className = "profile-section-title";
+    currentTitle.textContent = active ? "当前目标：" + (active.label || "当前学习") : "当前目标";
+    currentSection.appendChild(currentTitle);
+    const currentFields = renderProfileFields(active || {}, EPISODE_LABELS);
+    if (currentFields.length === 0) {
         const empty = document.createElement("p");
         empty.className = "profile-empty";
         empty.textContent = "聊几句之后，我会把了解到的学习情况整理在这里。";
-        elements.profile.appendChild(empty);
-        return;
+        currentSection.appendChild(empty);
+    } else {
+        currentFields.forEach(node => currentSection.appendChild(node));
     }
-    fields.forEach(field => {
+    elements.profile.appendChild(currentSection);
+
+    // 第二段：其他进行中的目标（只读展示，v1 不做手动切换）。
+    const others = episodes.filter(item => item.status !== "archived" && active && item.id !== active.id);
+    if (others.length > 0) {
+        const otherSection = document.createElement("div");
+        otherSection.className = "profile-section";
+        const otherTitle = document.createElement("div");
+        otherTitle.className = "profile-section-title";
+        otherTitle.textContent = "你还在进行的目标";
+        otherSection.appendChild(otherTitle);
+        const chips = document.createElement("div");
+        chips.className = "episode-chips";
+        others.forEach(item => {
+            const chip = document.createElement("span");
+            chip.className = "episode-chip";
+            chip.textContent = item.label || "未命名目标";
+            chips.appendChild(chip);
+        });
+        otherSection.appendChild(chips);
+        elements.profile.appendChild(otherSection);
+    }
+
+    // 第三段：跨目标通用的你。
+    const sharedFields = renderProfileFields(shared, SHARED_LABELS);
+    if (sharedFields.length > 0) {
+        const sharedSection = document.createElement("div");
+        sharedSection.className = "profile-section";
+        const sharedTitle = document.createElement("div");
+        sharedTitle.className = "profile-section-title";
+        sharedTitle.textContent = "关于你（跨目标通用）";
+        sharedSection.appendChild(sharedTitle);
+        sharedFields.forEach(node => sharedSection.appendChild(node));
+        elements.profile.appendChild(sharedSection);
+    }
+}
+
+/** 按给定的标签表渲染一组画像字段；返回 DOM 节点数组，空字段自动跳过。 */
+function renderProfileFields(source, labels) {
+    const nodes = [];
+    Object.keys(labels).forEach(field => {
+        const entry = source[field];
+        if (!entry || entry.value === undefined || entry.value === null) return;
         const item = document.createElement("div");
         item.className = "profile-item";
 
         const label = document.createElement("div");
         label.className = "label";
-        label.textContent = PROFILE_LABELS[field];
+        label.textContent = labels[field];
         item.appendChild(label);
 
         const value = document.createElement("div");
         value.className = "value";
-        const raw = profile[field].value;
+        const raw = entry.value;
         const unit = PROFILE_UNITS[field] || "";
         value.textContent = (Array.isArray(raw) ? raw.join("、") : String(raw)) + unit;
         item.appendChild(value);
 
-        if (profile[field].evidence) {
+        if (entry.evidence) {
             const quote = document.createElement("div");
             quote.className = "quote";
-            quote.textContent = "你说过：“" + profile[field].evidence + "”";
+            quote.textContent = "你说过：\u201c" + entry.evidence + "\u201d";
             item.appendChild(quote);
         }
 
-        elements.profile.appendChild(item);
+        nodes.push(item);
     });
+    return nodes;
 }
 
 /* ---------- 推荐历史与尝试后反馈 ---------- */
@@ -441,29 +777,41 @@ function renderHistory() {
 /**
  * 按方法聚合。一个人对一个方法只有一个真实体验，不该因为被推荐三次就填三次反馈，
  * 所以反馈绑定 (user, strategy) 而不是 (message, strategy)。
- * historyEvents 已按时间倒序，首次遇到某个方法时的时间就是最近一次推荐时间。
+ *
+ * 同一个方法只出一张主卡；它被推荐过的每一次记录收进卡内子层（可点击跳回那次对话）。
+ * 卡片的顺序显式按“最近一次被推荐的时间”倒序：哪个方法刚被推荐过，它就浮到最前。
  */
 function renderByMethod() {
     const grouped = new Map();
     historyEvents.forEach(event => {
+        const seen = new Set();
         (event.methods || []).forEach(method => {
+            // 同一次推荐里模型重复返回同一方法时只算一次，避免计数虚高。
+            if (seen.has(method.strategyId)) return;
+            seen.add(method.strategyId);
+            const occurrence = { at: event.recommendedAt, conversationId: event.conversationId };
             const existing = grouped.get(method.strategyId);
             if (existing) {
                 existing.count += 1;
                 existing.liked = existing.liked || method.liked;
+                existing.occurrences.push(occurrence);
             } else {
                 grouped.set(method.strategyId, {
                     method,
                     count: 1,
                     liked: method.liked,
                     latest: event.recommendedAt,
-                    latestMessageId: event.messageId
+                    latestMessageId: event.messageId,
+                    occurrences: [occurrence]
                 });
             }
         });
     });
 
-    grouped.forEach(entry => {
+    const entries = Array.from(grouped.values())
+        .sort((a, b) => new Date(b.latest) - new Date(a.latest));
+
+    entries.forEach(entry => {
         const card = document.createElement("div");
         card.className = "history-card";
         card.dataset.strategyId = entry.method.strategyId;
@@ -498,14 +846,36 @@ function renderByMethod() {
             card.appendChild(steps);
         }
 
+        if (entry.method.evidence && entry.method.evidence.length > 0) {
+            card.appendChild(renderEvidence(entry.method.evidence));
+        }
+
         const meta = document.createElement("p");
         meta.className = "meta";
-        const parts = ["推荐过 " + entry.count + " 次，最近 " + formatTime(entry.latest)];
-        if (entry.method.sourceIds && entry.method.sourceIds.length > 0) {
-            parts.push("来源 " + entry.method.sourceIds.join("、"));
-        }
-        meta.textContent = parts.join("　·　");
+        meta.textContent = "推荐过 " + entry.count + " 次";
         card.appendChild(meta);
+
+        // 子层：这个方法被推荐过的每一次，点时间可回到当时那次对话。
+        const recordsTitle = document.createElement("div");
+        recordsTitle.className = "records-title";
+        recordsTitle.textContent = "推荐记录（点击回到当时的对话）";
+        card.appendChild(recordsTitle);
+        const records = document.createElement("ul");
+        records.className = "method-records";
+        entry.occurrences.forEach(occurrence => {
+            const li = document.createElement("li");
+            const jump = document.createElement("button");
+            jump.type = "button";
+            jump.className = "record-link";
+            jump.textContent = formatTime(occurrence.at);
+            jump.addEventListener("click", () => {
+                closeHistory();
+                openConversation(occurrence.conversationId);
+            });
+            li.appendChild(jump);
+            records.appendChild(li);
+        });
+        card.appendChild(records);
 
         card.appendChild(renderTrialForm(entry.method, entry.latestMessageId));
         elements.historyList.appendChild(card);
